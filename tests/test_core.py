@@ -43,6 +43,7 @@ from src.config_loader import (
     PowerSection,
     SolverSection,
     VisualizationSection,
+    stack_layer_bounds,
 )
 from src.grid_builder import GridBuilder, GridBuilderError, MATERIALS
 from src.thermal_solver import ThermalSolver, SolverBCConfig, ThermalSolverError
@@ -58,7 +59,7 @@ def make_pipeline_config(
     nx: int = 10, ny: int = 10, nz: int = 12,
     dx: float = 25e-6, dy: float = 25e-6, dz: float = 10e-6,
     t_ambient_c: float = 25.0, h_convective: float = 2500.0, bottom_bc: str = "robin",
-    interposer_frac: float = 0.40, bump_frac: float = 0.20,
+    interposer_um: float = 40.0, bump_um: float = 20.0,
     die_power_w: float = 0.05, die_footprint_frac: float = 0.5,
 ) -> PipelineConfig:
     """Builds a small, fast-to-solve PipelineConfig for unit testing."""
@@ -67,7 +68,7 @@ def make_pipeline_config(
         boundary_conditions=BoundaryConditionsSection(
             t_ambient_c=t_ambient_c, h_convective=h_convective, bottom_bc=bottom_bc,
         ),
-        stack=StackSection(interposer_frac=interposer_frac, bump_frac=bump_frac),
+        stack=StackSection(interposer_um=interposer_um, bump_um=bump_um),
         power=PowerSection(die_power_w=die_power_w, die_footprint_frac=die_footprint_frac),
         solver=SolverSection(),
         visualization=VisualizationSection(),
@@ -92,10 +93,7 @@ def build_stack_grid(config: PipelineConfig):
     nz = config.grid.nz
     nx, ny = config.grid.nx, config.grid.ny
 
-    z_interposer_end = max(1, int(round(nz * config.stack.interposer_frac)))
-    z_bump_end = max(z_interposer_end + 1,
-                      int(round(nz * (config.stack.interposer_frac + config.stack.bump_frac))))
-    z_bump_end = min(z_bump_end, nz - 1)
+    z_interposer_end, z_bump_end = stack_layer_bounds(config)
 
     gb.assign_layer(slice(0, z_interposer_end), "silicon")
     gb.assign_layer(slice(z_interposer_end, z_bump_end), "bump_underfill_composite")

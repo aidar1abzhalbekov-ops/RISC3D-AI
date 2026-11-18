@@ -53,7 +53,7 @@ from typing import Optional
 from src.config_loader import (
     PipelineConfig, ConfigError, load_config,
     GridSection, BoundaryConditionsSection, StackSection, PowerSection,
-    SolverSection, VisualizationSection,
+    SolverSection, VisualizationSection, stack_layer_bounds,
 )
 from src.grid_builder import GridBuilder, GridBuilderError
 from src.thermal_solver import ThermalSolver, ThermalSolverError
@@ -126,7 +126,7 @@ def run_interactive_prompts():
     Prompts for every parameter listed in the interactive-CLI requirement,
     in micrometers/Celsius/Watts as the user naturally thinks in them, then
     converts into the SI-unit PipelineConfig this codebase uses internally.
-    Everything not explicitly prompted for (stack layer fractions, die
+    Everything not explicitly prompted for (stack layer thicknesses, die
     footprint fraction, output directory, hotspot threshold) uses a fixed,
     documented default -- kept out of the prompt list per the requested
     parameter set, but easy to expose later if needed.
@@ -137,13 +137,13 @@ def run_interactive_prompts():
     print("=" * 60)
 
     print("\nGrid dimensions (voxel counts):")
-    nx = prompt_int("nx", 60)
-    ny = prompt_int("ny", 60)
-    nz = prompt_int("nz", 40)
+    nx = prompt_int("nx", 40)
+    ny = prompt_int("ny", 40)
+    nz = prompt_int("nz", 24)
 
     print("\nVoxel spacing (micrometers):")
-    dx_um = prompt_float("dx (um)", 25.0)
-    dy_um = prompt_float("dy (um)", 25.0)
+    dx_um = prompt_float("dx (um)", 500.0)
+    dy_um = prompt_float("dy (um)", 500.0)
     dz_um = prompt_float("dz (um)", 10.0)
 
     print("\nThermal boundary conditions:")
@@ -161,7 +161,7 @@ def run_interactive_prompts():
 
     grid = GridSection(nx=nx, ny=ny, nz=nz, dx=dx_um * 1e-6, dy=dy_um * 1e-6, dz=dz_um * 1e-6)
     bc = BoundaryConditionsSection(t_ambient_c=t_ambient_c, h_convective=h_convective, bottom_bc="robin")
-    stack = StackSection()      # fixed defaults: interposer_frac=0.40, bump_frac=0.15
+    stack = StackSection()      # fixed defaults: interposer_um=100, bump_um=40 (die = remainder)
     power = PowerSection(die_power_w=die_power_w)  # fixed default die_footprint_frac=0.5
     solver = SolverSection(safety_factor=safety_factor)  # total_steps handled locally, not stored here
     viz = VisualizationSection()  # output_dir="outputs", hotspot_threshold_c=85.0
@@ -186,11 +186,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=None,
                          help="Load parameters from a JSON config file instead of prompting "
                               "or using flag defaults below.")
-    parser.add_argument("--nx", type=int, default=60)
-    parser.add_argument("--ny", type=int, default=60)
-    parser.add_argument("--nz", type=int, default=40)
-    parser.add_argument("--dx-um", type=float, default=25.0, help="Voxel size along X (micrometers).")
-    parser.add_argument("--dy-um", type=float, default=25.0, help="Voxel size along Y (micrometers).")
+    parser.add_argument("--nx", type=int, default=40)
+    parser.add_argument("--ny", type=int, default=40)
+    parser.add_argument("--nz", type=int, default=24)
+    parser.add_argument("--dx-um", type=float, default=500.0, help="Voxel size along X (micrometers).")
+    parser.add_argument("--dy-um", type=float, default=500.0, help="Voxel size along Y (micrometers).")
     parser.add_argument("--dz-um", type=float, default=10.0, help="Voxel size along Z (micrometers).")
     parser.add_argument("--t-ambient-c", type=float, default=25.0, help="Ambient temperature (degC).")
     parser.add_argument("--h-convective", type=float, default=1000.0, help="Convective coefficient (W/m^2K).")
@@ -239,9 +239,7 @@ def build_chiplet_stack(config: PipelineConfig) -> GridBuilder:
 
     nz = config.grid.nz
     nx, ny = config.grid.nx, config.grid.ny
-    z_interposer_end = max(1, int(round(nz * config.stack.interposer_frac)))
-    z_bump_end = max(z_interposer_end + 1, int(round(nz * (config.stack.interposer_frac + config.stack.bump_frac))))
-    z_bump_end = min(z_bump_end, nz - 1)
+    z_interposer_end, z_bump_end = stack_layer_bounds(config)
 
     try:
         gb.assign_layer(slice(0, z_interposer_end), "silicon")

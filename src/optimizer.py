@@ -35,7 +35,7 @@ from typing import List, Optional, Sequence, Tuple
  
 import numpy as np
  
-from src.config_loader import PipelineConfig
+from src.config_loader import PipelineConfig, stack_layer_bounds
 from src.grid_builder import GridBuilder
 from src.thermal_solver import ThermalSolver
  
@@ -176,13 +176,9 @@ class ChipletPlacementOptimizer:
     def _build_stack(self) -> Tuple[GridBuilder, int]:
         """Same layer split as main.build_chiplet_stack(), without power.
         Returns (GridBuilder, z index where the die layer starts)."""
-        s = self.config.stack
         nz = self.nz
-        z_interposer_end = max(1, int(round(nz * s.interposer_frac)))
-        z_bump_end = max(z_interposer_end + 1,
-                         int(round(nz * (s.interposer_frac + s.bump_frac))))
-        z_bump_end = min(z_bump_end, nz - 1)
- 
+        z_interposer_end, z_bump_end = stack_layer_bounds(self.config)
+
         gb = GridBuilder(config=self.config.to_dict())
         gb.assign_layer(slice(0, z_interposer_end), "silicon")
         gb.assign_layer(slice(z_interposer_end, z_bump_end), "bump_underfill_composite")
@@ -465,10 +461,6 @@ def render_optimization_plotly_report(
  
  
 def _die_start_index(config: PipelineConfig) -> int:
-    """Die-layer start index, computed exactly as in _build_stack()."""
-    s = config.stack
-    nz = config.grid.nz
-    z_interposer_end = max(1, int(round(nz * s.interposer_frac)))
-    z_bump_end = max(z_interposer_end + 1,
-                     int(round(nz * (s.interposer_frac + s.bump_frac))))
-    return min(z_bump_end, nz - 1)
+    """Die-layer start index, from the same stack_layer_bounds() used by _build_stack()."""
+    _, z_bump_end = stack_layer_bounds(config)
+    return z_bump_end

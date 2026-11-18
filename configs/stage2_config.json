@@ -15,8 +15,8 @@
     "side_bc": "neumann"
   },
   "stack": {
-    "interposer_frac": 0.4166667,
-    "bump_frac": 0.1666667
+    "interposer_um": 100.0,
+    "bump_um": 40.0
   },
   "power": {
     "die_power_w": 36,

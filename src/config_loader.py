@@ -26,7 +26,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, asdict, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("RISC3D-AI.ConfigLoader")
@@ -45,11 +45,12 @@ class ConfigError(Exception):
 
 @dataclass
 class GridSection:
-    nx: int = 60
-    ny: int = 60
-    nz: int = 40
-    dx: float = 25e-6
-    dy: float = 25e-6
+    # Round 3 scale: 20 x 20 mm package, 240 um stack (see docs/NEXT_TASK_stage2_wiring.md).
+    nx: int = 40
+    ny: int = 40
+    nz: int = 24
+    dx: float = 500e-6
+    dy: float = 500e-6
     dz: float = 10e-6
 
 
@@ -64,10 +65,12 @@ class BoundaryConditionsSection:
 
 @dataclass
 class StackSection:
-    """Vertical chiplet stack layout, as fractions of total nz (bottom to
-    top): interposer_frac + bump_frac + (remainder = Si die)."""
-    interposer_frac: float = 0.40
-    bump_frac: float = 0.15
+    """Vertical chiplet stack, authored as physical thicknesses in micrometres
+    (bottom to top): interposer_um (thinned Si), bump_um (microbump + underfill
+    composite), then the remainder of nz as the Si die. Each thickness must be a
+    whole number of voxels at grid.dz; see stack_layer_bounds()."""
+    interposer_um: float = 100.0
+    bump_um: float = 40.0
 
 
 @dataclass
@@ -120,11 +123,10 @@ class PipelineConfig:
             raise ConfigError(f"boundary_conditions.h_convective must be > 0 for Robin BC, got {bc.h_convective}")
 
         s = self.stack
-        if not (0.0 < s.interposer_frac < 1.0) or not (0.0 < s.bump_frac < 1.0):
-            raise ConfigError("stack.interposer_frac and stack.bump_frac must each be in (0, 1).")
-        if s.interposer_frac + s.bump_frac >= 1.0:
-            raise ConfigError("stack.interposer_frac + stack.bump_frac must be < 1.0 "
-                               "(remainder is the Si die layer).")
+        if s.interposer_um <= 0 or s.bump_um <= 0:
+            raise ConfigError(f"stack.interposer_um and stack.bump_um must be positive, "
+                              f"got ({s.interposer_um}, {s.bump_um}).")
+        stack_layer_bounds(self)  # raises ConfigError on non-integer voxel counts or no die layer
 
         p = self.power
         if p.die_power_w < 0:
@@ -187,6 +189,40 @@ class PipelineConfig:
             "solver": asdict(self.solver),
             "visualization": asdict(self.visualization),
         }
+
+
+def stack_layer_bounds(config: PipelineConfig) -> Tuple[int, int]:
+    """Single source of the vertical layer split, used by main.py, the tests and
+    the optimizer. Returns (z_interposer_end, z_bump_end) as voxel indices:
+    interposer = [0, z_interposer_end), composite = [z_interposer_end, z_bump_end),
+    Si die = [z_bump_end, nz).
+
+    Each authored thickness must be a whole number of voxels at grid.dz. Rounding
+    to the nearest voxel silently changes the layer thickness (e.g. 40 um at 10 um
+    voxels is exact, but 40 um at 16 um voxels would be 2.5 voxels), so a
+    non-integer count is rejected instead of rounded.
+    """
+    g = config.grid
+    s = config.stack
+    dz_um = g.dz * 1e6
+
+    def _voxels(name: str, thickness_um: float) -> int:
+        n = thickness_um / dz_um
+        k = int(round(n))
+        if k < 1 or abs(n - k) > 1e-6 * max(1.0, n):
+            raise ConfigError(
+                f"stack.{name}={thickness_um} um is not a whole number of voxels at "
+                f"dz={dz_um:.4g} um (gives {n:.4f}). Choose a multiple of dz."
+            )
+        return k
+
+    z_interposer_end = _voxels("interposer_um", s.interposer_um)
+    z_bump_end = z_interposer_end + _voxels("bump_um", s.bump_um)
+    if z_bump_end >= g.nz:
+        raise ConfigError(
+            f"Stack needs {z_bump_end} voxels below the die but grid.nz={g.nz} leaves no Si die layer."
+        )
+    return z_interposer_end, z_bump_end
 
 
 # ---------------------------------------------------------------------------

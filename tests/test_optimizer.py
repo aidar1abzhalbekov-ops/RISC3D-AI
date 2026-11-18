@@ -54,7 +54,7 @@ def make_config(nx: int = 20, ny: int = 20, nz: int = 12,
                          dx=dx_um * 1e-6, dy=dy_um * 1e-6, dz=dz_um * 1e-6),
         boundary_conditions=BoundaryConditionsSection(
             t_ambient_c=25.0, h_convective=h_convective, bottom_bc="robin"),
-        stack=StackSection(interposer_frac=0.40, bump_frac=0.20),
+        stack=StackSection(interposer_um=40.0, bump_um=20.0),
         power=PowerSection(die_power_w=0.0, die_footprint_frac=0.5),
         solver=SolverSection(),
         visualization=VisualizationSection(),
