@@ -56,9 +56,14 @@ MATERIALS: Dict[str, Dict[str, float]] = {
     "ambient_air": {"k": 0.026, "rho": 1.2, "cp": 1005.0},
 }
 
-# Recommended spatial discretization bounds from the physical spec.
-DX_DY_MIN, DX_DY_MAX = 10e-6, 50e-6
+# Spatial sanity bounds. dx/dy are in-plane cell sizes and span the die scale
+# used by the Round 3 package (500 um), so only physically implausible values
+# (outside 1 um .. 5 mm) are flagged. dz is the thin stack-layer spacing.
+DX_DY_MIN, DX_DY_MAX = 1e-6, 5e-3
 DZ_MIN, DZ_MAX = 5e-6, 20e-6
+# Warn when in-plane voxels are much larger than the vertical voxel: strongly
+# anisotropic cells (ratio above this) degrade iterative-solver conditioning.
+ASPECT_RATIO_WARN = 100.0
 
 BoundaryType = str  # one of: "dirichlet", "robin", "neumann"
 
@@ -82,14 +87,19 @@ class GridConfig:
         if min(self.nx, self.ny, self.nz) <= 0:
             raise ValueError(f"Grid dimensions must be positive, got "
                               f"({self.nx}, {self.ny}, {self.nz})")
-        if not (DX_DY_MIN * 0.5 <= self.dx <= DX_DY_MAX * 2.0):
+        if not (DX_DY_MIN <= self.dx <= DX_DY_MAX):
             logger.warning(
-                "dx=%.3e m is outside the recommended 10-50um range; "
-                "solver stability/accuracy may be affected.", self.dx
+                "dx=%.3e m is outside the 1um-5mm sanity range; check units.", self.dx
             )
-        if not (DX_DY_MIN * 0.5 <= self.dy <= DX_DY_MAX * 2.0):
+        if not (DX_DY_MIN <= self.dy <= DX_DY_MAX):
             logger.warning(
-                "dy=%.3e m is outside the recommended 10-50um range.", self.dy
+                "dy=%.3e m is outside the 1um-5mm sanity range; check units.", self.dy
+            )
+        aspect = max(self.dx, self.dy) / self.dz if self.dz > 0 else float("inf")
+        if aspect > ASPECT_RATIO_WARN:
+            logger.warning(
+                "In-plane/vertical voxel aspect ratio is %.0f:1 (above %.0f:1); "
+                "iterative solver conditioning may degrade.", aspect, ASPECT_RATIO_WARN
             )
         if not (DZ_MIN * 0.5 <= self.dz <= DZ_MAX * 2.0):
             logger.warning(

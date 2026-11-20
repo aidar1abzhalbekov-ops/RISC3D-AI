@@ -82,9 +82,20 @@ ITERATIVE_MAXITER = 2000
 # computed once and each later solve (new power map) is a back-substitution.
 # Measured in the development sandbox at N=38,400 (40x40x24): splu factor 7.5 s, then
 # ~0.06 s per solve, residual ~3.6e-11. Above this threshold the factor's
-# memory grows too quickly, so the Jacobi-BiCGSTAB fallback is used instead.
+# memory grows too quickly, so an ILU-preconditioned BiCGSTAB solve is used.
 # The threshold is a conservative choice; it has not been measured above 38,400.
 STEADY_DIRECT_MAX_UNKNOWNS = 100_000
+
+# ILU preconditioner for the iterative steady-state path. Measured in the
+# development sandbox at N=38,400: drop_tol=1e-3, fill_factor=10 converged to
+# max|dT| = 5e-6 K against the direct LU reference (Jacobi-BiCGSTAB did not
+# converge on the same operator).
+STEADY_ILU_DROP_TOL = 1e-3
+STEADY_ILU_FILL_FACTOR = 10.0
+# Relative residual ||M T + f|| / ||f|| that an iterative steady solve must meet
+# before its result is accepted. Stricter than the Krylov tolerance so that a
+# nominally converged but inaccurate solve cannot pass silently.
+STEADY_RESIDUAL_MAX = 1e-6
 
 _EPS = 1e-30  # guards against div-by-zero in harmonic means / coefficient sums
 
@@ -198,6 +209,8 @@ class ThermalSolver:
         # Cached LU factorization of the steady-state operator (see
         # STEADY_DIRECT_MAX_UNKNOWNS). Built lazily on the first steady solve.
         self._steady_lu = None
+        # Cached ILU preconditioner for the iterative steady-state path.
+        self._steady_ilu = None
         # Reference explicit-CFL dt, computed once, used only to flag (via a
         # warning, never an error) implicit steps taken at a dt so large
         # relative to the diffusive timescale that Crank-Nicolson's known
@@ -811,15 +824,17 @@ class ThermalSolver:
                 T_steady_flat = self._steady_lu.solve(-forcing)
                 backend = "direct"
             else:
-                diag = M.diagonal()
-                if np.any(np.abs(diag) < 1e-300):
-                    raise ThermalSolverError(
-                        "Zero (or near-zero) diagonal entry in the steady-state operator; "
-                        "cannot build a Jacobi preconditioner. Check for isolated/unassigned "
-                        "voxels in the grid."
-                    )
-                inv_diag = 1.0 / diag
-                preconditioner = sparse_linalg.LinearOperator(M.shape, matvec=lambda x: inv_diag * x)
+                if self._steady_ilu is None:
+                    try:
+                        self._steady_ilu = sparse_linalg.spilu(
+                            M.tocsc(), drop_tol=STEADY_ILU_DROP_TOL,
+                            fill_factor=STEADY_ILU_FILL_FACTOR,
+                        )
+                    except RuntimeError as exc:
+                        raise ThermalSolverError(
+                            f"ILU factorization of the steady-state operator failed: {exc}"
+                        ) from exc
+                preconditioner = sparse_linalg.LinearOperator(M.shape, matvec=self._steady_ilu.solve)
                 T_steady_flat, info = sparse_linalg.bicgstab(
                     M.tocsr(), -forcing, M=preconditioner,
                     rtol=ITERATIVE_RTOL, maxiter=ITERATIVE_MAXITER,
@@ -829,6 +844,14 @@ class ThermalSolver:
                         f"Steady-state iterative solve failed to converge (info={info}). "
                         f"This may indicate an ill-conditioned system (e.g. extreme material "
                         f"contrast) or a near-singular operator (check boundary conditions)."
+                    )
+                forcing_norm = np.linalg.norm(forcing)
+                rel_residual = np.linalg.norm(M @ T_steady_flat + forcing) / max(forcing_norm, 1e-300)
+                if rel_residual > STEADY_RESIDUAL_MAX:
+                    raise ThermalSolverError(
+                        f"Steady-state iterative solve reported convergence but its relative "
+                        f"residual is {rel_residual:.3e} (limit {STEADY_RESIDUAL_MAX:.1e}). "
+                        f"The result is not accepted."
                     )
                 backend = "iterative"
 

@@ -6,9 +6,9 @@ RISC3D-AI :: End-to-End 3D IC Thermal Simulation Pipeline (Interactive CLI)
 Entry point that:
   1. Prompts the user directly in the terminal for all simulation parameters
      (grid size, spacing, ambient temp, convective coefficient, die power,
-     step count, safety factor) -- NO configs/config.json dependency for
-     the default interactive workflow. Press Enter on any prompt to accept
-     the bracketed default.
+     step count, safety factor, and whether to run Stage 2). NO
+     configs/config.json dependency for the default interactive workflow.
+     Press Enter on any prompt to accept the bracketed default.
   2. Configures a multi-layer TSMC-style advanced-packaging chiplet stack
      (Interposer -> Microbump+Underfill composite -> Silicon Die with an
      active compute-block power density Q) via src.grid_builder.GridBuilder.
@@ -19,7 +19,18 @@ Entry point that:
      (orbit/zoom/pan, Z-layer slicing, click-to-inspect voxel temperatures)
      via src.visualization.ThermalVisualizer.render_interactive_webgl(),
      and opens it automatically in the default browser.
-  5. Reports wall-clock timing metrics for each pipeline phase.
+  5. Optionally (--optimize or the Stage 2 prompt) runs the chiplet placement
+     optimizer (src.optimizer) on the SAME GridSection and stack, writes
+     outputs/optimized_thermal_report.html, and opens it in the browser.
+  6. Reports wall-clock timing metrics for each pipeline phase.
+
+Exit codes:
+  0  success
+  1  Stage 1 (thermal simulation) or configuration failure
+  2  configuration failure caught BEFORE Stage 1 runs (e.g. a Stage 2 catalog
+     block does not fit the die; Stage 1 is never started)
+  3  Stage 2 runtime failure, after Stage 1 has already completed; Stage 1
+     outputs remain valid
 
 IMPORTANT INTERFACE NOTE (fix for a prior bug report):
 This file never reads SolverSection.method or SolverSection.dt -- those are
@@ -37,11 +48,13 @@ Usage:
     python main.py                     # interactive prompts (default)
     python main.py --config foo.json   # load parameters from a JSON file instead
     python main.py --nx 80 --ny 80 --nz 50 --die-power-w 20   # non-interactive, explicit flags
+    python main.py --optimize --optimize-iterations 200       # also run Stage 2
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import webbrowser
@@ -58,10 +71,22 @@ from src.config_loader import (
 from src.grid_builder import GridBuilder, GridBuilderError
 from src.thermal_solver import ThermalSolver, ThermalSolverError
 from src.visualization import ThermalVisualizer, VisualizationError
+from src.optimizer import (
+    ChipletPlacementOptimizer, OptimizerError, PlacementFitError,
+    render_optimization_plotly_report,
+)
 
 
 class PipelineError(Exception):
     """Raised on any unrecoverable failure in the end-to-end pipeline."""
+
+
+@dataclass
+class RunOptions:
+    """Everything the user chose that is not part of PipelineConfig."""
+    total_steps: int = 100
+    optimize: bool = False
+    optimize_iterations: int = 2000
 
 
 @dataclass
@@ -71,11 +96,12 @@ class TimingReport:
     cfl_check_s: float = 0.0
     solve_s: float = 0.0
     visualization_s: float = 0.0
+    optimize_s: float = 0.0
 
     @property
     def total_s(self) -> float:
         return (self.grid_build_s + self.solver_init_s + self.cfl_check_s
-                + self.solve_s + self.visualization_s)
+                + self.solve_s + self.visualization_s + self.optimize_s)
 
     def print_summary(self) -> None:
         print("\n" + "=" * 60)
@@ -87,6 +113,7 @@ class TimingReport:
             ("CFL stability check", self.cfl_check_s),
             ("Transient solve (explicit, N steps)", self.solve_s),
             ("WebGL 3D export + browser launch", self.visualization_s),
+            ("Stage 2 optimizer + Plotly report", self.optimize_s),
         ]
         for label, seconds in rows:
             print(f"  {label:<38s} {seconds:>10.4f} s")
@@ -119,6 +146,14 @@ def prompt_int(label: str, default: int) -> int:
     except ValueError:
         print(f"    Not a valid integer -- using default {default}")
         return default
+
+
+def prompt_yes_no(label: str, default: bool) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    raw = input(f"  {label} {suffix}: ").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("y", "yes")
 
 
 def run_interactive_prompts():
@@ -157,6 +192,12 @@ def run_interactive_prompts():
     total_steps = prompt_int("Total simulation steps", 100)
     safety_factor = prompt_float("Safety factor (0-1]", 0.8)
 
+    print("\nStage 2 (chiplet placement optimizer):")
+    run_optimizer = prompt_yes_no("Run Stage 2 automated chiplet placement optimizer?", False)
+    optimize_iterations = 2000
+    if run_optimizer:
+        optimize_iterations = prompt_int("Optimizer iterations", 2000)
+
     print()
 
     grid = GridSection(nx=nx, ny=ny, nz=nz, dx=dx_um * 1e-6, dy=dy_um * 1e-6, dz=dz_um * 1e-6)
@@ -173,8 +214,10 @@ def run_interactive_prompts():
     # total_steps is intentionally NOT a PipelineConfig/SolverSection field
     # (avoids ever depending on a field name that might not exist on a
     # stale local config_loader.py) -- it is threaded through main()
-    # separately as a plain local variable.
-    return config, total_steps
+    # separately inside RunOptions.
+    options = RunOptions(total_steps=total_steps, optimize=run_optimizer,
+                         optimize_iterations=optimize_iterations)
+    return config, options
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
@@ -200,6 +243,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory.")
     parser.add_argument("--no-browser", action="store_true",
                          help="Do not automatically open the generated HTML in a browser.")
+    parser.add_argument("--optimize", action="store_true",
+                         help="Also run the Stage 2 chiplet placement optimizer after Stage 1.")
+    parser.add_argument("--optimize-iterations", type=int, default=2000,
+                         help="Simulated-annealing iterations for Stage 2 (used with --optimize).")
     return parser
 
 
@@ -214,7 +261,9 @@ def build_config_from_flags(args: argparse.Namespace):
     config = PipelineConfig(grid=grid, boundary_conditions=bc, stack=stack, power=power,
                              solver=solver, visualization=viz)
     config.validate()
-    return config, args.total_steps
+    options = RunOptions(total_steps=args.total_steps, optimize=args.optimize,
+                         optimize_iterations=args.optimize_iterations)
+    return config, options
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +379,6 @@ def run_pipeline(config: PipelineConfig, total_steps: int, open_browser: bool) -
         hotspot_report = viz.get_hotspot_report(threshold_c=config.visualization.hotspot_threshold_c)
 
         if open_browser:
-            import os
             abs_path = os.path.abspath(html_path)
             try:
                 webbrowser.open(f"file://{abs_path}")
@@ -358,6 +406,32 @@ def run_pipeline(config: PipelineConfig, total_steps: int, open_browser: bool) -
     return {"timing": timing, "solve_result": result, "viz_report": report}
 
 
+def run_stage2(optimizer: ChipletPlacementOptimizer, config: PipelineConfig,
+               iterations: int, open_browser: bool) -> dict:
+    """Stage 2: runs the placement search on the same GridSection and stack as
+    Stage 1, writes the Plotly report under the configured output directory,
+    and opens it in the browser (failure to open never fails the run)."""
+    t0 = time.perf_counter()
+    result = optimizer.optimize(iterations=iterations)
+
+    report_path = os.path.join(config.visualization.output_dir, "optimized_thermal_report.html")
+    os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+    html_path = render_optimization_plotly_report(result, config, output_path=report_path)
+
+    if open_browser:
+        abs_path = os.path.abspath(html_path)
+        try:
+            webbrowser.open(f"file://{abs_path}")
+            print(f"[main] Opened {abs_path} in the default browser.")
+        except Exception as browser_exc:  # noqa: BLE001
+            print(f"[main] Could not auto-launch a browser ({browser_exc}). "
+                  f"Open manually: {abs_path}")
+    else:
+        print(f"[main] Browser launch skipped (--no-browser). Open manually: {html_path}")
+
+    return {"result": result, "html_path": html_path, "elapsed_s": time.perf_counter() - t0}
+
+
 def main(argv=None) -> int:
     parser = build_cli_parser()
     args = parser.parse_args(argv)
@@ -365,19 +439,32 @@ def main(argv=None) -> int:
     try:
         if args.config is not None:
             config = load_config(args.config)
-            total_steps = args.total_steps
+            options = RunOptions(total_steps=args.total_steps, optimize=args.optimize,
+                                 optimize_iterations=args.optimize_iterations)
         elif argv is None and len(sys.argv) == 1:
             # `python main.py` with truly no arguments -> interactive prompts.
-            config, total_steps = run_interactive_prompts()
+            config, options = run_interactive_prompts()
         else:
             # Any explicit flag supplied -> non-interactive, flag-driven run.
-            config, total_steps = build_config_from_flags(args)
+            config, options = build_config_from_flags(args)
     except ConfigError as exc:
         print(f"\n[FATAL] Configuration error: {exc}", file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
         print("\n[main] Input cancelled. Exiting.")
         return 1
+
+    # --- Configuration check for Stage 2, BEFORE Stage 1 starts. ---
+    # Constructing the optimizer runs the catalog-fit check (PlacementFitError)
+    # and builds the fixed stack. No thermal solve happens here.
+    optimizer: Optional[ChipletPlacementOptimizer] = None
+    if options.optimize:
+        try:
+            optimizer = ChipletPlacementOptimizer(config)
+        except (PlacementFitError, OptimizerError, ConfigError,
+                GridBuilderError, ThermalSolverError) as exc:
+            print(f"\n[FATAL] Stage 2 configuration error (Stage 1 not started): {exc}", file=sys.stderr)
+            return 2
 
     print("=" * 60)
     print("RISC3D-AI :: 3D IC Thermal Simulation Pipeline")
@@ -386,11 +473,15 @@ def main(argv=None) -> int:
           f"({config.grid.dx*1e6:.1f}x{config.grid.dy*1e6:.1f}x{config.grid.dz*1e6:.1f} um)")
     print(f"Ambient: {config.boundary_conditions.t_ambient_c:.1f}C | "
           f"h_convective: {config.boundary_conditions.h_convective:.1f} W/m^2K | "
-          f"Die power: {config.power.die_power_w:.2f}W | Steps: {total_steps}")
+          f"Die power: {config.power.die_power_w:.2f}W | Steps: {options.total_steps} | "
+          f"Stage 2: {'on' if options.optimize else 'off'}")
     print("=" * 60)
 
+    open_browser = not args.no_browser
+
+    # --- Stage 1: thermal simulation ---
     try:
-        outcome = run_pipeline(config, total_steps, open_browser=not args.no_browser)
+        outcome = run_pipeline(config, options.total_steps, open_browser=open_browser)
     except PipelineError as exc:
         print(f"\n[FATAL] Pipeline aborted: {exc}", file=sys.stderr)
         return 1
@@ -410,6 +501,30 @@ def main(argv=None) -> int:
     print(f"  Voxels > {config.visualization.hotspot_threshold_c:.1f}°C:       {report['hotspot_count']}")
     print(f"  Interactive 3D view:   {report['html_path']}")
     print("=" * 60)
+
+    # --- Stage 2: chiplet placement optimizer (only after Stage 1 succeeded) ---
+    if optimizer is not None:
+        try:
+            stage2 = run_stage2(optimizer, config, options.optimize_iterations, open_browser=open_browser)
+        except Exception as exc:  # noqa: BLE001 - Stage 1 outputs above remain valid
+            print(f"\n[FATAL] Stage 2 optimizer failed (Stage 1 results above are valid): {exc}",
+                  file=sys.stderr)
+            outcome["timing"].print_summary()
+            return 3
+
+        result = stage2["result"]
+        print("\n" + "=" * 60)
+        print("CHIPLET PLACEMENT OPTIMIZATION RESULTS (Stage 2)")
+        print("=" * 60)
+        print(f"  Best peak temperature: {result.best_peak_temperature_c:.2f} °C")
+        print(f"  Iterations:            {result.iterations}  "
+              f"(accepted {result.accepted_moves}, overlap candidates {result.overlap_candidates})")
+        print(f"  Report:                {stage2['html_path']}")
+        for block in result.placements_um():
+            print(f"    {block['name']:<16s} origin voxel ({block['x_voxel']}, {block['y_voxel']})  "
+                  f"{block['width_um']:.0f} x {block['depth_um']:.0f} um  {block['power_w']:.1f} W")
+        print("=" * 60)
+        outcome["timing"].optimize_s = stage2["elapsed_s"]
 
     outcome["timing"].print_summary()
     return 0
