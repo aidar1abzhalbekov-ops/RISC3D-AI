@@ -67,6 +67,7 @@ from src.config_loader import (
     PipelineConfig, ConfigError, load_config,
     GridSection, BoundaryConditionsSection, StackSection, PowerSection,
     SolverSection, VisualizationSection, stack_layer_bounds,
+    COOLING_PRESETS, apply_cooling_preset, cooling_metrics,
 )
 from src.grid_builder import GridBuilder, GridBuilderError
 from src.thermal_solver import ThermalSolver, ThermalSolverError
@@ -247,6 +248,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
                          help="Also run the Stage 2 chiplet placement optimizer after Stage 1.")
     parser.add_argument("--optimize-iterations", type=int, default=2000,
                          help="Simulated-annealing iterations for Stage 2 (used with --optimize).")
+    parser.add_argument("--preset", type=str, default=None, choices=sorted(COOLING_PRESETS),
+                         help="Named cooling preset: sets die power and h_convective together "
+                              "(overrides --die-power-w and --h-convective).")
     return parser
 
 
@@ -269,6 +273,14 @@ def build_config_from_flags(args: argparse.Namespace):
 # ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
+
+def steady_peak_temperature_c(config: PipelineConfig) -> float:
+    """Peak steady-state temperature (C) of the Stage 1 stack, from a direct solve."""
+    gb = build_chiplet_stack(config)
+    solver = ThermalSolver.from_grid_builder(gb)
+    T = solver.solve_steady_state(apply_result=False)
+    return float(T.max()) - 273.15
+
 
 def build_chiplet_stack(config: PipelineConfig) -> GridBuilder:
     """
@@ -454,6 +466,15 @@ def main(argv=None) -> int:
         print("\n[main] Input cancelled. Exiting.")
         return 1
 
+    if args.preset is not None:
+        try:
+            config = apply_cooling_preset(config, args.preset)
+        except ConfigError as exc:
+            print(f"\n[FATAL] Configuration error: {exc}", file=sys.stderr)
+            return 1
+        print(f"[main] Cooling preset '{args.preset}': "
+              f"{COOLING_PRESETS[args.preset]['description']}")
+
     # --- Configuration check for Stage 2, BEFORE Stage 1 starts. ---
     # Constructing the optimizer runs the catalog-fit check (PlacementFitError)
     # and builds the fixed stack. No thermal solve happens here.
@@ -494,6 +515,23 @@ def main(argv=None) -> int:
     print("THERMAL ANALYSIS RESULTS")
     print("=" * 60)
     print(f"  Peak temperature:      {report['peak_temperature_c']:.2f} °C")
+    # R_ja is a steady-state quantity. The explicit run above covers only
+    # total_steps steps and is not generally at steady state, so R_ja and the
+    # steady peak come from a direct steady solve of the same stack.
+    steady_peak_c = steady_peak_temperature_c(config)
+    metrics = cooling_metrics(config, steady_peak_c)
+    transient_rise = report['peak_temperature_c'] - config.boundary_conditions.t_ambient_c
+    steady_rise = steady_peak_c - config.boundary_conditions.t_ambient_c
+    print(f"  Steady-state peak:     {steady_peak_c:.2f} °C")
+    if steady_rise > 0 and transient_rise < 0.5 * steady_rise:
+        print(f"  [main] WARNING: the {options.total_steps}-step transient reached only "
+              f"{transient_rise:.2f} K of the {steady_rise:.2f} K steady rise; the transient peak "
+              f"is not a steady-state result.")
+    print(f"  Die power:             {metrics['power_w']:.2f} W over "
+          f"{metrics['footprint_cm2']:.3f} cm^2 = {metrics['w_per_cm2']:.2f} W/cm^2")
+    if metrics['r_ja_k_per_w'] is not None:
+        print(f"  R_ja (steady):         {metrics['r_ja_k_per_w']:.4f} K/W "
+              f"(h = {metrics['h_convective']:.0f} W/m^2K)")
     print(f"  Peak location (i,j,k): {report['peak_location_ijk']}")
     print(f"  Peak location (um):    "
           f"({report['peak_location_um'][0]:.1f}, {report['peak_location_um'][1]:.1f}, "

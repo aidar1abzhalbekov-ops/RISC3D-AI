@@ -320,3 +320,73 @@ if __name__ == "__main__":
     written_path = write_default_config(os.path.join("configs_smoke_test", "config.json"))
     reloaded = load_config(written_path)
     print("Reloaded config:", reloaded.as_dict())
+
+
+# ---------------------------------------------------------------------------
+# Named cooling presets (validation plan step 2)
+# ---------------------------------------------------------------------------
+
+# Each preset fixes one matched pair of power and convective coefficient.
+# Raising power without raising h gives physically meaningless temperatures
+# (see claude/VALIDATION_PLAN.md, Part 1), so the two are always set together.
+COOLING_PRESETS: Dict[str, Dict[str, Any]] = {
+    "passive-lowpower": {
+        "die_power_w": 12.0,
+        "h_convective": 1000.0,
+        "description": "12 W die, passive heatsink in still air",
+    },
+    "cowos-coldplate": {
+        "die_power_w": 150.0,
+        "h_convective": 25000.0,
+        "description": "150 W die, cold plate",
+    },
+}
+
+
+def apply_cooling_preset(config: PipelineConfig, name: str) -> PipelineConfig:
+    """Sets die power and h_convective to a named preset and re-validates.
+
+    Raises ConfigError for an unknown preset name. Other fields are untouched.
+    """
+    if name not in COOLING_PRESETS:
+        raise ConfigError(
+            f"unknown cooling preset '{name}'; choose one of: {', '.join(sorted(COOLING_PRESETS))}"
+        )
+    preset = COOLING_PRESETS[name]
+    config.power.die_power_w = float(preset["die_power_w"])
+    config.boundary_conditions.h_convective = float(preset["h_convective"])
+    config.validate()
+    return config
+
+
+def die_footprint_m2(config: PipelineConfig) -> float:
+    """Active die footprint in m^2.
+
+    ASSUMPTION: the die occupies die_footprint_frac of each lateral extent,
+    centred, so its area is (frac * Lx) * (frac * Ly).
+    """
+    frac = config.power.die_footprint_frac
+    g = config.grid
+    return (frac * g.nx * g.dx) * (frac * g.ny * g.dy)
+
+
+def cooling_metrics(config: PipelineConfig, peak_c: float) -> Dict[str, Any]:
+    """Header metrics for a result: power density over the die footprint and the
+    measured junction-to-ambient resistance R_ja = (T_peak - T_ambient) / P.
+
+    Returns None for R_ja when the die power is zero (undefined).
+    """
+    power = float(config.power.die_power_w)
+    area_cm2 = die_footprint_m2(config) * 1e4
+    w_per_cm2 = power / area_cm2 if area_cm2 > 0 else float("nan")
+    if power > 0:
+        r_ja = (float(peak_c) - float(config.boundary_conditions.t_ambient_c)) / power
+    else:
+        r_ja = None
+    return {
+        "power_w": power,
+        "footprint_cm2": area_cm2,
+        "w_per_cm2": w_per_cm2,
+        "r_ja_k_per_w": r_ja,
+        "h_convective": float(config.boundary_conditions.h_convective),
+    }
