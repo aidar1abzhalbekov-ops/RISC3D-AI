@@ -100,6 +100,35 @@ STEADY_RESIDUAL_MAX = 1e-6
 _EPS = 1e-30  # guards against div-by-zero in harmonic means / coefficient sums
 
 
+def mirror_sink_to_top(grid_arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    Returns a copy of grid_arrays with the z axis reversed, so that the layer
+    that was at the top of the stack becomes index 0 and the solver's sink
+    (which always sits at index 0) is applied to it.
+
+    Physically this places the heat sink on the original top face and moves
+    the original bottom face (the sink face before the mirror) to the
+    adiabatic side. The solver then runs unchanged.
+
+    The returned temperature field is in the mirrored index frame: physical
+    z-index k corresponds to array index nz-1-k. Use T[:, :, ::-1] to recover
+    the original frame.
+
+    The boundary_mask bits for the -z and +z faces are swapped so that the
+    sink flag stays on index 0 after the reversal.
+    """
+    out = dict(grid_arrays)
+    for key in REQUIRED_ARRAY_KEYS:
+        arr = np.asarray(grid_arrays[key])
+        if arr.ndim != 3:
+            raise ThermalSolverError(f"mirror_sink_to_top: '{key}' must be 3-D, got shape {arr.shape}")
+        out[key] = np.ascontiguousarray(arr[:, :, ::-1])
+    mask = np.asarray(out["boundary_mask"]).astype(np.uint8)
+    swapped = ((mask & 0b01) << 1) | ((mask & 0b10) >> 1) | (mask & 0b11111100)
+    out["boundary_mask"] = swapped.astype(np.asarray(grid_arrays["boundary_mask"]).dtype)
+    return out
+
+
 class ThermalSolverError(Exception):
     """Raised on invalid grid input, boundary configuration, or a violated
     numerical-stability condition."""
@@ -244,7 +273,12 @@ class ThermalSolver:
                 raise ThermalSolverError(f"grid_arrays['{k}'] contains NaN/Inf values.")
 
     @classmethod
-    def from_grid_builder(cls, grid_builder, initial_temperature_k: Optional[np.ndarray] = None) -> "ThermalSolver":
+    def from_grid_builder(
+        cls,
+        grid_builder,
+        initial_temperature_k: Optional[np.ndarray] = None,
+        sink_side: str = "bottom",
+    ) -> "ThermalSolver":
         """
         Convenience constructor: builds a ThermalSolver directly from a
         (validated, boundary-tagged) GridBuilder instance, pulling grid
@@ -255,6 +289,9 @@ class ThermalSolver:
         except AttributeError as exc:
             raise ThermalSolverError(f"grid_builder does not expose validate_grid(): {exc}") from exc
 
+        if sink_side not in ("bottom", "top"):
+            raise ThermalSolverError(f"sink_side must be 'bottom' or 'top', got '{sink_side}'")
+
         arrays = grid_builder.export_arrays()
         cfg = grid_builder.config
         bc_config = SolverBCConfig(
@@ -262,7 +299,11 @@ class ThermalSolver:
             t_ambient_k=cfg.t_ambient_k, h_convective=cfg.h_convective,
             bottom_bc=cfg.bottom_bc, top_bc=cfg.top_bc, side_bc=cfg.side_bc,
         )
-        return cls(arrays, bc_config, initial_temperature_k=initial_temperature_k)
+        if sink_side == "top":
+            arrays = mirror_sink_to_top(arrays)
+        solver = cls(arrays, bc_config, initial_temperature_k=initial_temperature_k)
+        solver.sink_side = sink_side
+        return solver
 
     @staticmethod
     def _harmonic_mean(a: np.ndarray, b: np.ndarray) -> np.ndarray:
