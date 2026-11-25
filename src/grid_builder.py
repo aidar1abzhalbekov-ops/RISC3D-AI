@@ -40,18 +40,70 @@ logger = logging.getLogger("RISC3D-AI.GridBuilder")
 # that is broadcast to all three axes.
 # ---------------------------------------------------------------------------
 
+# Conductivities of the bump and matrix materials, from Rao et al., TSCI 27(5B),
+# 2023, Table 2 (Sn2.5Ag solder 57 W/mK, underfill 0.2 W/mK).
+K_SOLDER_TSCI = 57.0
+K_UNDERFILL_TSCI = 0.2
+
+# Microbump geometry. ASSUMPTION: 20 um bump diameter at 40 um pitch, a typical
+# CoWoS-class microbump. Not taken from a cited source; change here to study it.
+BUMP_DIAMETER_UM = 20.0
+BUMP_PITCH_UM = 40.0
+
+
+def bump_volume_fraction(diameter_um: float, pitch_um: float) -> float:
+    """Volume fraction of solder columns in a square array of pitch p.
+
+    The columns span the full layer thickness, so the volume fraction equals the
+    area fraction pi*(d/2)^2 / p^2. Requires 0 < d <= p.
+    """
+    if not (0.0 < diameter_um <= pitch_um):
+        raise ValueError(f"need 0 < diameter <= pitch, got d={diameter_um}, p={pitch_um}")
+    return float(np.pi * (diameter_um / 2.0) ** 2 / pitch_um ** 2)
+
+
+def composite_conductivity(k_bump: float, k_matrix: float, bump_fraction: float) -> Tuple[float, float]:
+    """Homogenized conductivities (k_xy, k_z) of a bump-in-matrix composite.
+
+    k_z  (vertical): the columns run through the whole layer, so vertical heat
+         flows through both phases in parallel. This is the parallel form of
+         Rao et al. (TSCI 2023), Eq. (2), applied to the column geometry:
+         k_z = v_b k_b + (1 - v_b) k_m.
+    k_xy (lateral): Maxwell-Garnett for dispersed cylinders in a matrix. This is
+         a central estimate from the Maxwell-Garnett formula, not from the TSCI
+         paper. The TSCI series and parallel forms bound it (see bounds below).
+
+    Bounds on k_xy, both from TSCI Eqs. (10)-(11) applied laterally:
+         series   k_xy >= 1 / (v_b/k_b + (1-v_b)/k_m)
+         parallel k_xy <= v_b k_b + (1-v_b) k_m
+    """
+    if not (0.0 <= bump_fraction <= 1.0):
+        raise ValueError(f"bump_fraction must be in [0, 1], got {bump_fraction}")
+    if k_bump <= 0.0 or k_matrix <= 0.0:
+        raise ValueError("conductivities must be positive")
+    v = float(bump_fraction)
+    k_z = v * k_bump + (1.0 - v) * k_matrix
+    k_xy = k_matrix * ((k_bump + 2.0 * k_matrix) + 2.0 * v * (k_bump - k_matrix)) / (
+        (k_bump + 2.0 * k_matrix) - v * (k_bump - k_matrix)
+    )
+    return k_xy, k_z
+
+
+_V_BUMP = bump_volume_fraction(BUMP_DIAMETER_UM, BUMP_PITCH_UM)
+_KXY_COMPOSITE, _KZ_COMPOSITE = composite_conductivity(K_SOLDER_TSCI, K_UNDERFILL_TSCI, _V_BUMP)
+
 MATERIALS: Dict[str, Dict[str, float]] = {
     "silicon": {"k": 149.0, "rho": 2330.0, "cp": 712.0},
     "copper": {"k": 400.0, "rho": 8960.0, "cp": 385.0},
     "tim": {"k": 12.5, "rho": 2000.0, "cp": 1000.0},          # midpoint of 5-20 W/mK
-    "solder_microbump": {"k": 60.0, "rho": 7300.0, "cp": 230.0},
-    "underfill": {"k": 0.8, "rho": 1200.0, "cp": 1100.0},
-    # Homogenized anisotropic composite (microbump array + underfill).
-    # kx = ky = lateral (underfill-dominated), kz = vertical (bump-dominated).
+    "solder_microbump": {"k": K_SOLDER_TSCI, "rho": 7300.0, "cp": 230.0},   # TSCI Table 2
+    "underfill": {"k": K_UNDERFILL_TSCI, "rho": 1200.0, "cp": 1100.0},      # TSCI Table 2
+    # Homogenized anisotropic composite (microbump array + underfill), derived from the
+    # volume fraction of the bump geometry above. kx = ky lateral, kz vertical.
     "bump_underfill_composite": {
-        "kx": 2.0, "ky": 2.0, "kz": 20.0,       # midpoints of spec ranges
-        "rho": 3500.0,                          # volumetric mix estimate
-        "cp": 450.0,
+        "kx": _KXY_COMPOSITE, "ky": _KXY_COMPOSITE, "kz": _KZ_COMPOSITE,
+        "rho": 3500.0,                          # volumetric mix estimate (unchanged)
+        "cp": 450.0,                            # volumetric mix estimate (unchanged)
     },
     "ambient_air": {"k": 0.026, "rho": 1.2, "cp": 1005.0},
 }

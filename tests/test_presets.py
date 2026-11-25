@@ -107,7 +107,7 @@ class TestCli:
 class TestCliResultsPath:
     """End-to-end: main.main() prints R_ja from the steady solve, and warns when the
     short transient is far from steady state. Values measured this session with
-    --preset passive-lowpower (steady peak 79.97 C, R_ja 4.5810 K/W)."""
+    --preset passive-lowpower (steady peak 80.11 C, R_ja 4.5929 K/W; after the composite update)."""
 
     def test_passive_preset_prints_steady_rja_and_warning(self, tmp_path, capsys):
         rc = main_mod.main(["--preset", "passive-lowpower", "--no-browser",
@@ -115,5 +115,5 @@ class TestCliResultsPath:
         out = capsys.readouterr().out
         assert rc == 0
         assert "R_ja (steady):" in out
-        assert "4.5810 K/W" in out
+        assert "4.5929 K/W" in out
         assert "WARNING: the 100-step transient" in out
