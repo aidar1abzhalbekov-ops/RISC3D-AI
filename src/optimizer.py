@@ -35,7 +35,7 @@ from typing import List, Optional, Sequence, Tuple
  
 import numpy as np
  
-from src.config_loader import PipelineConfig, stack_layer_bounds
+from src.config_loader import PipelineConfig, stack_layer_bounds, has_top_package
 from src.grid_builder import GridBuilder
 from src.thermal_solver import ThermalSolver
  
@@ -133,6 +133,13 @@ class ChipletPlacementOptimizer:
                 f"config must be a PipelineConfig, got {type(config).__name__}"
             )
         config.validate()
+        if has_top_package(config):
+            # The SA evaluation builds its own heatsink-bottom stack and power map; it does not
+            # yet mirror the top-side package. Refuse rather than optimize against the wrong sink.
+            raise OptimizerError(
+                "ChipletPlacementOptimizer does not yet support the top-side package "
+                "(stack.tim1_um / lid_um / tim2_um). Set them to 0 for Stage 2, or use Stage 1."
+            )
         self.config = config
         self.catalog: Tuple[ChipletBlock, ...] = tuple(catalog)
         if not self.catalog:

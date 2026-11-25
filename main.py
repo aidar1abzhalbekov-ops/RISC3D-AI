@@ -66,8 +66,8 @@ from typing import Optional
 from src.config_loader import (
     PipelineConfig, ConfigError, load_config,
     GridSection, BoundaryConditionsSection, StackSection, PowerSection,
-    SolverSection, VisualizationSection, stack_layer_bounds,
-    COOLING_PRESETS, apply_cooling_preset, cooling_metrics,
+    SolverSection, VisualizationSection, stack_extents, sink_side_for,
+    has_top_package, COOLING_PRESETS, apply_cooling_preset, cooling_metrics,
 )
 from src.grid_builder import GridBuilder, GridBuilderError
 from src.thermal_solver import ThermalSolver, ThermalSolverError
@@ -277,7 +277,7 @@ def build_config_from_flags(args: argparse.Namespace):
 def steady_peak_temperature_c(config: PipelineConfig) -> float:
     """Peak steady-state temperature (C) of the Stage 1 stack, from a direct solve."""
     gb = build_chiplet_stack(config)
-    solver = ThermalSolver.from_grid_builder(gb)
+    solver = ThermalSolver.from_grid_builder(gb, sink_side=sink_side_for(config))
     T = solver.solve_steady_state(apply_result=False)
     return float(T.max()) - 273.15
 
@@ -298,31 +298,43 @@ def build_chiplet_stack(config: PipelineConfig) -> GridBuilder:
     except GridBuilderError as exc:
         raise PipelineError(f"GridBuilder construction failed: {exc}") from exc
 
-    nz = config.grid.nz
     nx, ny = config.grid.nx, config.grid.ny
-    z_interposer_end, z_bump_end = stack_layer_bounds(config)
+    ext = stack_extents(config)
+    z_interposer_end, z_bump_end, z_die_end = ext["interposer_end"], ext["bump_end"], ext["die_end"]
+    z_tim1_end, z_lid_end, z_tim2_end = ext["tim1_end"], ext["lid_end"], ext["tim2_end"]
 
     try:
         gb.assign_layer(slice(0, z_interposer_end), "silicon")
         gb.assign_layer(slice(z_interposer_end, z_bump_end), "bump_underfill_composite")
-        gb.assign_layer(slice(z_bump_end, nz), "silicon")
+        gb.assign_layer(slice(z_bump_end, z_die_end), "silicon")
+        # Top-side package layers (empty slices are skipped; a zero thickness means absent).
+        if z_tim1_end > z_die_end:
+            gb.assign_layer(slice(z_die_end, z_tim1_end), "tim_top")
+        if z_lid_end > z_tim1_end:
+            gb.assign_layer(slice(z_tim1_end, z_lid_end), "copper")
+        if z_tim2_end > z_lid_end:
+            gb.assign_layer(slice(z_lid_end, z_tim2_end), "tim_top")
         gb.tag_boundaries()
 
         margin_x = int(round(nx * (1.0 - config.power.die_footprint_frac) / 2.0))
         margin_y = int(round(ny * (1.0 - config.power.die_footprint_frac) / 2.0))
         x_slice = slice(margin_x, nx - margin_x)
         y_slice = slice(margin_y, ny - margin_y)
-        z_slice = slice(z_bump_end, nz)
+        z_slice = slice(z_bump_end, z_die_end)
 
         gb.add_power_source(power_watts=config.power.die_power_w, x_slice=x_slice, y_slice=y_slice, z_slice=z_slice)
         gb.validate_grid()
     except GridBuilderError as exc:
         raise PipelineError(f"Chiplet stack assembly failed: {exc}") from exc
 
+    top_note = ""
+    if has_top_package(config):
+        top_note = (f", TIM1 z[{z_die_end}:{z_tim1_end}], lid z[{z_tim1_end}:{z_lid_end}], "
+                    f"TIM2 z[{z_lid_end}:{z_tim2_end}] (heatsink on top)")
     print(
         f"[main] Stack assembled: interposer z[0:{z_interposer_end}], "
         f"bump+underfill z[{z_interposer_end}:{z_bump_end}], "
-        f"Si die z[{z_bump_end}:{nz}] with {config.power.die_power_w:.2f}W active source "
+        f"Si die z[{z_bump_end}:{z_die_end}]{top_note} with {config.power.die_power_w:.2f}W active source "
         f"over footprint x[{margin_x}:{nx - margin_x}] y[{margin_y}:{ny - margin_y}]"
     )
     return gb
@@ -339,7 +351,7 @@ def run_pipeline(config: PipelineConfig, total_steps: int, open_browser: bool) -
     # --- Phase 2: Solver initialization ---
     t0 = time.perf_counter()
     try:
-        solver = ThermalSolver.from_grid_builder(gb)
+        solver = ThermalSolver.from_grid_builder(gb, sink_side=sink_side_for(config))
     except ThermalSolverError as exc:
         raise PipelineError(f"ThermalSolver initialization failed: {exc}") from exc
     timing.solver_init_s = time.perf_counter() - t0

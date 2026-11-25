@@ -71,6 +71,12 @@ class StackSection:
     whole number of voxels at grid.dz; see stack_layer_bounds()."""
     interposer_um: float = 100.0
     bump_um: float = 40.0
+    # Optional top-side package layers, stacked above the die in this order:
+    # TIM1 (die -> lid), lid (copper), TIM2 (lid -> heatsink). 0 = layer absent.
+    # Heatsink is the Robin face on the top; the solver is then run with sink_side="top".
+    tim1_um: float = 0.0
+    lid_um: float = 0.0
+    tim2_um: float = 0.0
 
 
 @dataclass
@@ -126,7 +132,10 @@ class PipelineConfig:
         if s.interposer_um <= 0 or s.bump_um <= 0:
             raise ConfigError(f"stack.interposer_um and stack.bump_um must be positive, "
                               f"got ({s.interposer_um}, {s.bump_um}).")
-        stack_layer_bounds(self)  # raises ConfigError on non-integer voxel counts or no die layer
+        for name in ("tim1_um", "lid_um", "tim2_um"):
+            if getattr(s, name) < 0:
+                raise ConfigError(f"stack.{name} must be >= 0 (0 = layer absent), got {getattr(s, name)}")
+        stack_extents(self)  # raises ConfigError on non-integer voxel counts or no die layer
 
         p = self.power
         if p.die_power_w < 0:
@@ -191,22 +200,44 @@ class PipelineConfig:
         }
 
 
-def stack_layer_bounds(config: PipelineConfig) -> Tuple[int, int]:
-    """Single source of the vertical layer split, used by main.py, the tests and
-    the optimizer. Returns (z_interposer_end, z_bump_end) as voxel indices:
-    interposer = [0, z_interposer_end), composite = [z_interposer_end, z_bump_end),
-    Si die = [z_bump_end, nz).
+def has_top_package(config: PipelineConfig) -> bool:
+    """True if any top-side package layer (TIM1, lid, TIM2) is present."""
+    s = config.stack
+    return s.tim1_um > 0 or s.lid_um > 0 or s.tim2_um > 0
 
-    Each authored thickness must be a whole number of voxels at grid.dz. Rounding
-    to the nearest voxel silently changes the layer thickness (e.g. 40 um at 10 um
-    voxels is exact, but 40 um at 16 um voxels would be 2.5 voxels), so a
-    non-integer count is rejected instead of rounded.
+
+def sink_side_for(config: PipelineConfig) -> str:
+    """Heatsink face for ThermalSolver.from_grid_builder(): 'top' when the top-side
+    package is present (the heatsink sits on the lid), otherwise 'bottom' (the
+    interposer underside, the original configuration)."""
+    return "top" if has_top_package(config) else "bottom"
+
+
+def stack_extents(config: PipelineConfig) -> Dict[str, int]:
+    """Single source of the full vertical layer split, from the bottom of the grid up.
+
+    Keys (voxel indices, half-open ranges starting at the previous key):
+      interposer_end : interposer  = [0, interposer_end)
+      bump_end       : microbump composite = [interposer_end, bump_end)
+      die_end        : Si die       = [bump_end, die_end)
+      tim1_end       : TIM1         = [die_end, tim1_end)
+      lid_end        : lid          = [tim1_end, lid_end)
+      tim2_end       : TIM2         = [lid_end, tim2_end)  and tim2_end == nz
+
+    The die is the remainder of grid.nz after the top-side layers, so the top-side
+    thicknesses are authored and the die thickness follows from nz. With no top
+    package, die_end == nz and every top key equals nz (the original stack).
+
+    Each authored thickness must be a whole number of voxels at grid.dz; rounding
+    would silently change the layer thickness, so non-integer counts are rejected.
     """
     g = config.grid
     s = config.stack
     dz_um = g.dz * 1e6
 
-    def _voxels(name: str, thickness_um: float) -> int:
+    def _voxels(name: str, thickness_um: float, allow_zero: bool = False) -> int:
+        if allow_zero and thickness_um == 0:
+            return 0
         n = thickness_um / dz_um
         k = int(round(n))
         if k < 1 or abs(n - k) > 1e-6 * max(1.0, n):
@@ -216,13 +247,36 @@ def stack_layer_bounds(config: PipelineConfig) -> Tuple[int, int]:
             )
         return k
 
-    z_interposer_end = _voxels("interposer_um", s.interposer_um)
-    z_bump_end = z_interposer_end + _voxels("bump_um", s.bump_um)
-    if z_bump_end >= g.nz:
+    n_tim1 = _voxels("tim1_um", s.tim1_um, allow_zero=True)
+    n_lid = _voxels("lid_um", s.lid_um, allow_zero=True)
+    n_tim2 = _voxels("tim2_um", s.tim2_um, allow_zero=True)
+    n_top = n_tim1 + n_lid + n_tim2
+
+    interposer_end = _voxels("interposer_um", s.interposer_um)
+    bump_end = interposer_end + _voxels("bump_um", s.bump_um)
+    die_end = g.nz - n_top
+    if die_end <= bump_end:
         raise ConfigError(
-            f"Stack needs {z_bump_end} voxels below the die but grid.nz={g.nz} leaves no Si die layer."
+            f"Stack needs {bump_end} voxels below the die plus {n_top} above it, but "
+            f"grid.nz={g.nz} leaves no Si die layer."
         )
-    return z_interposer_end, z_bump_end
+    return {
+        "interposer_end": interposer_end,
+        "bump_end": bump_end,
+        "die_end": die_end,
+        "tim1_end": die_end + n_tim1,
+        "lid_end": die_end + n_tim1 + n_lid,
+        "tim2_end": g.nz,
+    }
+
+
+def stack_layer_bounds(config: PipelineConfig) -> Tuple[int, int]:
+    """Returns (z_interposer_end, z_bump_end) as voxel indices, from stack_extents().
+    Kept for callers that only need the bottom split (interposer and composite).
+    The die is [z_bump_end, stack_extents()['die_end']); with no top package that
+    is [z_bump_end, nz)."""
+    ext = stack_extents(config)
+    return ext["interposer_end"], ext["bump_end"]
 
 
 # ---------------------------------------------------------------------------

@@ -96,6 +96,9 @@ MATERIALS: Dict[str, Dict[str, float]] = {
     "silicon": {"k": 149.0, "rho": 2330.0, "cp": 712.0},
     "copper": {"k": 400.0, "rho": 8960.0, "cp": 385.0},
     "tim": {"k": 12.5, "rho": 2000.0, "cp": 1000.0},          # midpoint of 5-20 W/mK
+    # Top-side package TIM (TIM1 die-to-lid and TIM2 lid-to-heatsink). ASSUMPTION: k = 5 W/mK,
+    # the low end of the general TIM range 0.5-10 W/mK (USPTO 11626343). Not CoWoS-specific.
+    "tim_top": {"k": 5.0, "rho": 2000.0, "cp": 1000.0},
     "solder_microbump": {"k": K_SOLDER_TSCI, "rho": 7300.0, "cp": 230.0},   # TSCI Table 2
     "underfill": {"k": K_UNDERFILL_TSCI, "rho": 1200.0, "cp": 1100.0},      # TSCI Table 2
     # Homogenized anisotropic composite (microbump array + underfill), derived from the
